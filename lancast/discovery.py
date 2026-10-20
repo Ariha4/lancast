@@ -8,6 +8,13 @@ before you even know who's out there would mean N handshakes for N possible
 hosts on the subnet. A single UDP broadcast reaches everyone in one send,
 and occasional packet loss is acceptable since discovery is periodic --
 a missed beacon just means you get the next one a few seconds later.
+
+Beacons are unauthenticated hints, not proof of identity. Anyone on the LAN
+can send one with any name and any fingerprint. That's acceptable because
+nothing is trusted on the strength of a beacon: the TLS handshake in
+transfer.py is what proves a peer holds the key for its fingerprint. A
+beacon is treated as untrusted input, so every field is validated before it
+reaches the registry or the terminal.
 """
 
 from __future__ import annotations
@@ -18,11 +25,14 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from lancast.identity import IdentityError, normalize_fingerprint
+
 DISCOVERY_PORT = 50999
 BROADCAST_ADDR = "255.255.255.255"
 BEACON_INTERVAL_SEC = 2.0
 PEER_TIMEOUT_SEC = 6.0
-MAGIC = "LANCAST_BEACON_V1"
+MAGIC = "LANCAST_BEACON_V2"
+MAX_BEACON_NAME_LENGTH = 64
 
 
 @dataclass
@@ -30,6 +40,7 @@ class Peer:
     name: str
     host: str
     tcp_port: int
+    fingerprint: str = ""
     last_seen: float = field(default_factory=time.time)
 
 
@@ -64,15 +75,16 @@ class PeerRegistry:
 class BeaconSender:
     """Periodically broadcasts this host's identity over UDP."""
 
-    def __init__(self, name: str, tcp_port: int, interval: float = BEACON_INTERVAL_SEC) -> None:
+    def __init__(self, name: str, tcp_port: int, fingerprint: str = "", interval: float = BEACON_INTERVAL_SEC) -> None:
         self.name = name
         self.tcp_port = tcp_port
+        self.fingerprint = fingerprint
         self.interval = interval
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
     def _payload(self) -> bytes:
-        message = {"magic": MAGIC, "name": self.name, "tcp_port": self.tcp_port}
+        message = {"magic": MAGIC, "name": self.name, "tcp_port": self.tcp_port, "fingerprint": self.fingerprint}
         return json.dumps(message).encode("utf-8")
 
     def _run(self) -> None:
@@ -121,17 +133,12 @@ class BeaconListener:
             sock.close()
 
     def _handle_packet(self, data: bytes, addr: tuple[str, int]) -> None:
-        try:
-            message = json.loads(data.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+        peer = parse_beacon(data, addr)
+        if peer is None:
             return
-        if message.get("magic") != MAGIC:
-            return
-        host, _ = addr
-        tcp_port = message.get("tcp_port")
-        if tcp_port == self.self_tcp_port:
+        if peer.tcp_port == self.self_tcp_port:
             return  # ignore our own beacon
-        self.registry.upsert(Peer(name=message.get("name", "unknown"), host=host, tcp_port=tcp_port))
+        self.registry.upsert(peer)
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -141,3 +148,41 @@ class BeaconListener:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=1)
+
+
+def clean_display_name(raw_name: object) -> str:
+    """Keep only printable characters so a beacon can't inject terminal escape codes."""
+    if not isinstance(raw_name, str):
+        return "unknown"
+    kept_characters = []
+    for character in raw_name[:MAX_BEACON_NAME_LENGTH]:
+        if character.isprintable():
+            kept_characters.append(character)
+    cleaned = "".join(kept_characters).strip()
+    return cleaned or "unknown"
+
+
+def parse_beacon(data: bytes, addr: tuple[str, int]) -> Peer | None:
+    """Turn a raw UDP packet into a Peer, or None if anything about it is off."""
+    try:
+        message = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(message, dict) or message.get("magic") != MAGIC:
+        return None
+
+    tcp_port = message.get("tcp_port")
+    # bool is a subclass of int in Python, so True would otherwise pass as port 1
+    if isinstance(tcp_port, bool) or not isinstance(tcp_port, int) or not 1 <= tcp_port <= 65535:
+        return None
+
+    fingerprint = ""
+    raw_fingerprint = message.get("fingerprint")
+    if isinstance(raw_fingerprint, str):
+        try:
+            fingerprint = normalize_fingerprint(raw_fingerprint)
+        except IdentityError:
+            fingerprint = ""
+
+    host, _ = addr
+    return Peer(name=clean_display_name(message.get("name")), host=host, tcp_port=tcp_port, fingerprint=fingerprint)

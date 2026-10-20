@@ -21,7 +21,11 @@ RUN pytest -q
 EXPOSE 50999/udp
 EXPOSE 51000/tcp
 
-VOLUME ["/received"]
+# Identity (private key) and trust store live here. Mount a volume so the
+# device keeps the same fingerprint across container restarts.
+ENV LANCAST_HOME=/lancast-home
+
+VOLUME ["/received", "/lancast-home"]
 
 ENTRYPOINT ["lancast"]
 CMD ["serve", "--dest", "/received", "--port", "51000"]
