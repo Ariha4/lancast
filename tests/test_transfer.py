@@ -63,7 +63,7 @@ def test_receive_file_strips_path_components(tmp_path: Path) -> None:
 
     client, server = _socket_pair()
     try:
-        name_bytes = "../../evil.txt".encode("utf-8")
+        name_bytes = b"../../evil.txt"
         header = struct.pack(FILENAME_LEN_FMT, len(name_bytes)) + name_bytes
         payload = b"binary data"
         header += struct.pack(PAYLOAD_LEN_FMT, len(payload))

@@ -1,6 +1,9 @@
+import json
 import time
 
-from lancast.discovery import Peer, PeerRegistry
+import pytest
+
+from lancast.discovery import MAGIC, Peer, PeerRegistry, parse_beacon
 
 
 def test_registry_upsert_and_active_peers() -> None:
@@ -43,12 +46,6 @@ def test_registry_tracks_multiple_distinct_peers() -> None:
 
 
 # ---------- regression tests for beacon validation ----------
-
-import json
-
-import pytest
-
-from lancast.discovery import MAGIC, parse_beacon
 
 SENDER_ADDR = ("10.0.0.7", 50999)
 

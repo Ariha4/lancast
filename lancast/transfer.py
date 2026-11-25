@@ -25,13 +25,12 @@ sendall() returned.
 
 from __future__ import annotations
 
-import os
 import socket
 import ssl
 import struct
 import threading
 from pathlib import Path
-from typing import Callable
+from typing import BinaryIO, Callable
 
 from lancast.identity import Identity, IdentityError, normalize_fingerprint
 from lancast.tls import make_client_context, make_server_context, peer_fingerprint
@@ -126,7 +125,7 @@ def safe_filename(raw_filename: str) -> str:
     return base_name
 
 
-def _open_unique(dest_dir: Path, filename: str) -> tuple[Path, object]:
+def _open_unique(dest_dir: Path, filename: str) -> tuple[Path, BinaryIO]:
     """Open a brand-new file, never overwriting one that already exists.
 
     'x' mode is create-exclusive: the OS fails the open if the name is
