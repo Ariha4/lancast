@@ -99,7 +99,11 @@ beacon field. It also lists what LANCast does *not* defend against.
 ```bash
 pip install -e ".[dev]"
 pytest tests/ -v
+ruff check .        # lint (config in pyproject.toml)
+mypy                # typecheck the lancast package
 ```
+
+CI runs ruff and mypy once, and the test suite on Python 3.10, 3.11 and 3.12.
 
 ## License
 

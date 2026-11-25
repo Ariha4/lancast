@@ -11,10 +11,24 @@ license = {text = "MIT"}
 dependencies = ["cryptography>=41.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "ruff>=0.6", "mypy>=1.10"]
 
 [project.scripts]
 lancast = "lancast.cli:main"
 
 [tool.setuptools]
 packages = ["lancast"]
+
+[tool.ruff]
+line-length = 130
+
+[tool.ruff.lint]
+# Pyflakes, import order, likely bugs (bugbear), and syntax upgrades for the
+# oldest supported Python.
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.mypy]
+files = ["lancast"]
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true

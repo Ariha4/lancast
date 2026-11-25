@@ -25,13 +25,12 @@ sendall() returned.
 
 from __future__ import annotations
 
-import os
 import socket
 import ssl
 import struct
 import threading
 from pathlib import Path
-from typing import Callable
+from typing import BinaryIO, Callable
 
 from lancast.identity import Identity, IdentityError, normalize_fingerprint
 from lancast.tls import make_client_context, make_server_context, peer_fingerprint
@@ -46,6 +45,7 @@ MAX_FILENAME_BYTES = 4096
 CONNECTION_TIMEOUT_SEC = 30.0  # per blocking read/write, so a stalled peer can't hold a thread forever
 MAX_CONCURRENT_TRANSFERS = 8
 MAX_DUPLICATE_NAME_ATTEMPTS = 1000
+ACCEPT_RETRY_DELAY_SEC = 0.1
 FORBIDDEN_FILENAMES = {"", ".", ".."}
 
 STATUS_OK = 0
@@ -125,7 +125,7 @@ def safe_filename(raw_filename: str) -> str:
     return base_name
 
 
-def _open_unique(dest_dir: Path, filename: str) -> tuple[Path, object]:
+def _open_unique(dest_dir: Path, filename: str) -> tuple[Path, BinaryIO]:
     """Open a brand-new file, never overwriting one that already exists.
 
     'x' mode is create-exclusive: the OS fails the open if the name is
@@ -164,15 +164,24 @@ def send_file(sock: socket.socket, file_path: Path) -> None:
         raise TransferRefused(accept_status)
 
     # Stream from disk in chunks instead of reading the whole file into memory.
+    # Send exactly the size promised in the header, never "until EOF": if the
+    # file is appended to mid-send, extra bytes would land where the receiver
+    # expects the next frame; if it is truncated, the receiver would sit
+    # waiting for bytes that never come until its timeout fires.
     with open(file_path, "rb") as file_handle:
-        while True:
-            chunk = file_handle.read(RECV_CHUNK_SIZE)
+        remaining = file_size
+        while remaining > 0:
+            chunk = file_handle.read(min(remaining, RECV_CHUNK_SIZE))
             if not chunk:
-                break
+                raise ProtocolError(
+                    f"{file_path.name} shrank while it was being sent "
+                    f"({file_size - remaining} of {file_size} bytes sent)"
+                )
             try:
                 sock.sendall(chunk)
             except OSError as error:
                 raise ProtocolError(f"Connection failed while sending: {error}") from error
+            remaining -= len(chunk)
 
     final_status = _recv_status(sock)
     if final_status != STATUS_OK:
@@ -210,8 +219,15 @@ def receive_file(
         _send_status(sock, STATUS_TOO_LARGE)
         raise TransferRefused(STATUS_TOO_LARGE)
 
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path, file_handle = _open_unique(dest_dir, filename)
+    # The sender is blocked waiting for the accept status. If we can't create
+    # the file, say so, rather than dropping the connection and leaving the
+    # sender to guess (it would otherwise blame a trust problem).
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path, file_handle = _open_unique(dest_dir, filename)
+    except (OSError, ProtocolError) as error:
+        _send_status(sock, STATUS_WRITE_FAILED)
+        raise ProtocolError(f"Could not create {filename!r} in {dest_dir}: {error}") from error
 
     finished = False
     try:
@@ -297,7 +313,7 @@ class FileReceiverServer:
         self.connection_timeout = connection_timeout
         self._transfer_slots = threading.BoundedSemaphore(max_concurrent)
         self._server_sock: socket.socket | None = None
-        self._running = False
+        self._stopping = threading.Event()
         self.ready = threading.Event()
 
     def serve_forever(self) -> None:
@@ -306,21 +322,30 @@ class FileReceiverServer:
         self._server_sock.bind((self.bind_host, self.port))
         self._server_sock.listen(5)
         self.port = self._server_sock.getsockname()[1]  # resolves port 0 to the real port
-        self._running = True
         self.ready.set()
 
-        while self._running:
-            try:
-                conn, addr = self._server_sock.accept()
-            except OSError:
-                break
-            # Cap concurrent transfers. Past the cap, drop the connection
-            # instead of spawning yet another thread.
-            if not self._transfer_slots.acquire(blocking=False):
-                self._report_rejection(addr, ProtocolError("Too many concurrent transfers"))
-                conn.close()
-                continue
-            threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
+        try:
+            while not self._stopping.is_set():
+                try:
+                    conn, addr = self._server_sock.accept()
+                except OSError:
+                    if self._stopping.is_set():
+                        break  # stop() shut the socket down under us
+                    # Anything else (ECONNABORTED when a client gives up mid-
+                    # handshake, EMFILE when out of file descriptors) is about one
+                    # connection or is temporary. Don't let it end the server;
+                    # pause briefly so a persistent error can't spin the CPU.
+                    self._stopping.wait(ACCEPT_RETRY_DELAY_SEC)
+                    continue
+                # Cap concurrent transfers. Past the cap, drop the connection
+                # instead of spawning yet another thread.
+                if not self._transfer_slots.acquire(blocking=False):
+                    self._report_rejection(addr, ProtocolError("Too many concurrent transfers"))
+                    conn.close()
+                    continue
+                threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
+        finally:
+            self._server_sock.close()
 
     def _report_rejection(self, addr: tuple, error: Exception) -> None:
         if self.on_rejected:
@@ -351,6 +376,14 @@ class FileReceiverServer:
             self._transfer_slots.release()
 
     def stop(self) -> None:
-        self._running = False
+        self._stopping.set()
         if self._server_sock is not None:
+            # close() alone doesn't wake a thread blocked in accept() on Linux:
+            # the kernel keeps the listening socket alive until accept returns,
+            # so serve_forever would hang (and keep the port bound) until the
+            # next client connected. shutdown() makes accept() fail right away.
+            try:
+                self._server_sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # e.g. ENOTCONN on platforms that don't allow it on listeners
             self._server_sock.close()
