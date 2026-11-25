@@ -46,6 +46,7 @@ MAX_FILENAME_BYTES = 4096
 CONNECTION_TIMEOUT_SEC = 30.0  # per blocking read/write, so a stalled peer can't hold a thread forever
 MAX_CONCURRENT_TRANSFERS = 8
 MAX_DUPLICATE_NAME_ATTEMPTS = 1000
+ACCEPT_RETRY_DELAY_SEC = 0.1
 FORBIDDEN_FILENAMES = {"", ".", ".."}
 
 STATUS_OK = 0
@@ -313,7 +314,7 @@ class FileReceiverServer:
         self.connection_timeout = connection_timeout
         self._transfer_slots = threading.BoundedSemaphore(max_concurrent)
         self._server_sock: socket.socket | None = None
-        self._running = False
+        self._stopping = threading.Event()
         self.ready = threading.Event()
 
     def serve_forever(self) -> None:
@@ -322,21 +323,30 @@ class FileReceiverServer:
         self._server_sock.bind((self.bind_host, self.port))
         self._server_sock.listen(5)
         self.port = self._server_sock.getsockname()[1]  # resolves port 0 to the real port
-        self._running = True
         self.ready.set()
 
-        while self._running:
-            try:
-                conn, addr = self._server_sock.accept()
-            except OSError:
-                break
-            # Cap concurrent transfers. Past the cap, drop the connection
-            # instead of spawning yet another thread.
-            if not self._transfer_slots.acquire(blocking=False):
-                self._report_rejection(addr, ProtocolError("Too many concurrent transfers"))
-                conn.close()
-                continue
-            threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
+        try:
+            while not self._stopping.is_set():
+                try:
+                    conn, addr = self._server_sock.accept()
+                except OSError:
+                    if self._stopping.is_set():
+                        break  # stop() shut the socket down under us
+                    # Anything else (ECONNABORTED when a client gives up mid-
+                    # handshake, EMFILE when out of file descriptors) is about one
+                    # connection or is temporary. Don't let it end the server;
+                    # pause briefly so a persistent error can't spin the CPU.
+                    self._stopping.wait(ACCEPT_RETRY_DELAY_SEC)
+                    continue
+                # Cap concurrent transfers. Past the cap, drop the connection
+                # instead of spawning yet another thread.
+                if not self._transfer_slots.acquire(blocking=False):
+                    self._report_rejection(addr, ProtocolError("Too many concurrent transfers"))
+                    conn.close()
+                    continue
+                threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
+        finally:
+            self._server_sock.close()
 
     def _report_rejection(self, addr: tuple, error: Exception) -> None:
         if self.on_rejected:
@@ -367,6 +377,14 @@ class FileReceiverServer:
             self._transfer_slots.release()
 
     def stop(self) -> None:
-        self._running = False
+        self._stopping.set()
         if self._server_sock is not None:
+            # close() alone doesn't wake a thread blocked in accept() on Linux:
+            # the kernel keeps the listening socket alive until accept returns,
+            # so serve_forever would hang (and keep the port bound) until the
+            # next client connected. shutdown() makes accept() fail right away.
+            try:
+                self._server_sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # e.g. ENOTCONN on platforms that don't allow it on listeners
             self._server_sock.close()
