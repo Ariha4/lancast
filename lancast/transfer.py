@@ -164,15 +164,24 @@ def send_file(sock: socket.socket, file_path: Path) -> None:
         raise TransferRefused(accept_status)
 
     # Stream from disk in chunks instead of reading the whole file into memory.
+    # Send exactly the size promised in the header, never "until EOF": if the
+    # file is appended to mid-send, extra bytes would land where the receiver
+    # expects the next frame; if it is truncated, the receiver would sit
+    # waiting for bytes that never come until its timeout fires.
     with open(file_path, "rb") as file_handle:
-        while True:
-            chunk = file_handle.read(RECV_CHUNK_SIZE)
+        remaining = file_size
+        while remaining > 0:
+            chunk = file_handle.read(min(remaining, RECV_CHUNK_SIZE))
             if not chunk:
-                break
+                raise ProtocolError(
+                    f"{file_path.name} shrank while it was being sent "
+                    f"({file_size - remaining} of {file_size} bytes sent)"
+                )
             try:
                 sock.sendall(chunk)
             except OSError as error:
                 raise ProtocolError(f"Connection failed while sending: {error}") from error
+            remaining -= len(chunk)
 
     final_status = _recv_status(sock)
     if final_status != STATUS_OK:
@@ -210,8 +219,15 @@ def receive_file(
         _send_status(sock, STATUS_TOO_LARGE)
         raise TransferRefused(STATUS_TOO_LARGE)
 
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path, file_handle = _open_unique(dest_dir, filename)
+    # The sender is blocked waiting for the accept status. If we can't create
+    # the file, say so, rather than dropping the connection and leaving the
+    # sender to guess (it would otherwise blame a trust problem).
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path, file_handle = _open_unique(dest_dir, filename)
+    except (OSError, ProtocolError) as error:
+        _send_status(sock, STATUS_WRITE_FAILED)
+        raise ProtocolError(f"Could not create {filename!r} in {dest_dir}: {error}") from error
 
     finished = False
     try:

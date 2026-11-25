@@ -12,6 +12,7 @@ from lancast.transfer import (
     STATUS_BAD_FRAME,
     STATUS_FMT,
     STATUS_TOO_LARGE,
+    STATUS_WRITE_FAILED,
     ProtocolError,
     TransferRefused,
     _recv_exact,
@@ -271,3 +272,142 @@ def test_connections_beyond_concurrency_cap_are_dropped(make_device, running_ser
     finally:
         first_client.close()
         second_client.close()
+
+
+# ---------- the file or the destination changes under us ----------
+
+class _ShrinkingFile:
+    """Stands in for a file that a sender stat()s at N bytes, but which some
+    other process truncates before all N bytes are read."""
+
+    def __init__(self, real_path: Path, readable_bytes: int) -> None:
+        self._handle = open(real_path, "rb")
+        self._left = readable_bytes
+
+    def read(self, size: int) -> bytes:
+        data = self._handle.read(min(size, self._left))
+        self._left -= len(data)
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self._handle.close()
+
+
+def test_sender_stops_at_declared_size_when_file_grows(tmp_path: Path, monkeypatch) -> None:
+    """Before: send_file streamed until EOF, so bytes appended after the
+    header was sent spilled past the frame and the receiver saved a file that
+    didn't match the length it was promised."""
+    src_file = tmp_path / "growing.log"
+    src_file.write_bytes(b"a" * 10)
+    real_stat = Path.stat
+
+    def stat_before_growth(path: Path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if path == src_file:
+            # Header goes out claiming 10 bytes; then the file grows to 20.
+            src_file.write_bytes(b"a" * 10 + b"b" * 10)
+        return result
+
+    monkeypatch.setattr(Path, "stat", stat_before_growth)
+
+    client, server = _socket_pair()
+    server.settimeout(2)
+    try:
+        sender_thread = threading.Thread(target=send_file, args=(client, src_file))
+        sender_thread.start()
+        received_path = receive_file(server, tmp_path / "received")
+        sender_thread.join(timeout=2)
+
+        assert received_path.read_bytes() == b"a" * 10
+        # Nothing extra is left in the stream after the frame.
+        client.shutdown(socket.SHUT_WR)
+        server.settimeout(2)
+        assert server.recv(1) == b""
+    finally:
+        client.close()
+        server.close()
+
+
+def test_sender_reports_file_that_shrinks_mid_send(tmp_path: Path, monkeypatch) -> None:
+    """Before: the sender hit EOF early, then waited for a final status the
+    receiver would never send (it was still waiting for payload), and the
+    user saw a timeout instead of the real cause."""
+    src_file = tmp_path / "shrinking.bin"
+    src_file.write_bytes(b"x" * 100)
+    real_open = open
+
+    def open_shrinking(path, mode="r", *args, **kwargs):
+        # Only the sender's read is affected; the receiver writes normally.
+        if Path(path) == src_file and mode == "rb":
+            return _ShrinkingFile(path, readable_bytes=40)
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("lancast.transfer.open", open_shrinking, raising=False)
+
+    client, server = _socket_pair()
+    server.settimeout(2)  # so the old behaviour fails the test instead of hanging it
+    client.settimeout(2)
+    receiver_errors: list[Exception] = []
+
+    def _receive() -> None:
+        try:
+            receive_file(server, tmp_path / "received")
+        except ProtocolError as error:
+            receiver_errors.append(error)
+
+    receiver_thread = threading.Thread(target=_receive)
+    receiver_thread.start()
+    try:
+        with pytest.raises(ProtocolError, match="shrank"):
+            send_file(client, src_file)
+        client.close()  # what send_file_to_peer's `with` block does on error
+        receiver_thread.join(timeout=2)
+        assert receiver_errors, "receiver should see the connection drop"
+        assert not (tmp_path / "received" / "shrinking.bin").exists()
+    finally:
+        client.close()
+        server.close()
+
+
+def test_receiver_reports_unwritable_destination(tmp_path: Path) -> None:
+    """Before: if dest_dir couldn't be created, receive_file raised a raw
+    OSError without a status byte. The sender just saw the connection close
+    and was told the receiver 'may not trust this device yet'."""
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("a file where the destination directory should be")
+
+    client, server = _socket_pair()
+    try:
+        _send_header(client, b"notes.txt", 5)
+        with pytest.raises(ProtocolError, match="Could not create"):
+            receive_file(server, blocker / "received")
+        assert _read_status(client) == STATUS_WRITE_FAILED
+    finally:
+        client.close()
+        server.close()
+
+
+def test_sender_gets_protocol_error_when_receiver_drops_mid_payload(tmp_path: Path) -> None:
+    """A receiver that accepts and then vanishes must surface as ProtocolError
+    (which the CLI reports), not a raw BrokenPipeError or ssl error."""
+    src_file = tmp_path / "big.bin"
+    src_file.write_bytes(b"z" * (4 * 1024 * 1024))
+
+    client, server = _socket_pair()
+    try:
+        def _accept_then_vanish() -> None:
+            _recv_exact(server, struct.calcsize(FILENAME_LEN_FMT) + len(b"big.bin") + struct.calcsize(PAYLOAD_LEN_FMT))
+            server.sendall(struct.pack(STATUS_FMT, 0))
+            server.close()
+
+        receiver_thread = threading.Thread(target=_accept_then_vanish)
+        receiver_thread.start()
+        client.settimeout(5)
+        with pytest.raises(ProtocolError):
+            send_file(client, src_file)
+        receiver_thread.join(timeout=2)
+    finally:
+        client.close()
